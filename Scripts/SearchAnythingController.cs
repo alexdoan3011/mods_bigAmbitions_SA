@@ -1,8 +1,10 @@
 using System.Collections.Generic;
 using BAModAPI;
+using BigAmbitions.InputSystem;
 using TMPro;
 using UnityEngine;
 using UnityEngine.EventSystems;
+using UnityEngine.InputSystem;
 using UnityEngine.UI;
 
 namespace SearchAnything
@@ -15,6 +17,9 @@ namespace SearchAnything
     /// result, focuses the city map on that building — opening the map first if
     /// it is closed.
     /// </summary>
+    // Run before the game's default-order scripts so we can reset the "Interact"
+    // action before the game reads it (used to nullify F while the modifier is held).
+    [DefaultExecutionOrder(-1000)]
     public sealed class SearchAnythingController : MonoBehaviour
     {
         private ModContext _context;
@@ -44,6 +49,10 @@ namespace SearchAnything
         private bool _active;
         private bool _tornDown;
         private bool _focusPending;
+        // True while the current key hold began with the modifier already down
+        // (i.e. a real "modifier first, then key" combo) — only then do we suppress
+        // the game action bound to the key.
+        private bool _comboKeyActive;
         private float _nextScan;
         private float _nextReassert;
 
@@ -285,6 +294,10 @@ namespace SearchAnything
                     TryAttach();
             }
 
+            // Stop the bound key from also triggering whatever game action it is
+            // mapped to while the modifier is held.
+            SuppressGameShortcut();
+
             if (HotkeyPressed())
                 SetActive(!_active);
 
@@ -307,20 +320,22 @@ namespace SearchAnything
             }
         }
 
+        /// <summary>True while the configured modifier (Ctrl/Shift/Alt) is held, or always when none is set.</summary>
+        private bool ModifierHeld() => _modifierIndex switch
+        {
+            1 => Input.GetKey(KeyCode.LeftControl) || Input.GetKey(KeyCode.RightControl),
+            2 => Input.GetKey(KeyCode.LeftShift) || Input.GetKey(KeyCode.RightShift),
+            3 => Input.GetKey(KeyCode.LeftAlt) || Input.GetKey(KeyCode.RightAlt),
+            _ => true,
+        };
+
         /// <summary>True on the frame the configured shortcut is pressed.</summary>
         private bool HotkeyPressed()
         {
             if (_panel == null || _hotkey == KeyCode.None)
                 return false;
 
-            bool modifierHeld = _modifierIndex switch
-            {
-                1 => Input.GetKey(KeyCode.LeftControl) || Input.GetKey(KeyCode.RightControl),
-                2 => Input.GetKey(KeyCode.LeftShift) || Input.GetKey(KeyCode.RightShift),
-                3 => Input.GetKey(KeyCode.LeftAlt) || Input.GetKey(KeyCode.RightAlt),
-                _ => true,
-            };
-            if (!modifierHeld)
+            if (!ModifierHeld())
                 return false;
 
             // Without a modifier the bare key could collide with typing, so ignore
@@ -329,6 +344,78 @@ namespace SearchAnything
                 return false;
 
             return Input.GetKeyDown(_hotkey);
+        }
+
+        /// <summary>
+        /// While a modifier is configured and held together with the bound key,
+        /// reset every game input action that is bound to that key so the combo
+        /// (e.g. Ctrl+F) opens the search window without also firing the game
+        /// action mapped to the key. This is binding-aware: it works for any
+        /// chosen key and honours the player's in-game rebinds (the colliding
+        /// action is discovered from the live bindings, not hard-coded to F). It
+        /// only fires when the key was pressed while the modifier was already
+        /// held, so pressing the key first (or on its own) still triggers the
+        /// game normally, and nothing is touched when no modifier is configured.
+        /// The class runs at an early execution order, so the reset lands before
+        /// the game reads the action that frame.
+        /// </summary>
+        private void SuppressGameShortcut()
+        {
+            if (_modifierIndex == 0 || _hotkey == KeyCode.None)
+                return;
+
+            // Only treat the key as part of the combo when the modifier was
+            // already held the moment the key went down. Pressing the key first
+            // (and adding the modifier afterwards) must NOT be suppressed.
+            if (Input.GetKeyDown(_hotkey))
+                _comboKeyActive = ModifierHeld();
+            if (Input.GetKeyUp(_hotkey))
+                _comboKeyActive = false;
+
+            if (!_comboKeyActive || !Input.GetKey(_hotkey))
+                return;
+
+            try
+            {
+                var keyboard = Keyboard.current;
+                if (keyboard == null)
+                    return;
+
+                // The mod's key list and the Input System Key enum share names
+                // (F, G, F1, PageUp, ...), so we can resolve the matching control.
+                if (!System.Enum.TryParse<Key>(_hotkey.ToString(), out var key))
+                    return;
+                InputControl control = keyboard[key];
+                if (control == null)
+                    return;
+
+                ResetActionsUsingControl(InputActionHelper.PlayerInputActionMap.Values, control);
+                ResetActionsUsingControl(InputActionHelper.InteriorDesignerInputActionMap.Values, control);
+            }
+            catch
+            {
+                // The input system may not be initialised yet (e.g. on the main
+                // menu); ignore until it is.
+            }
+        }
+
+        /// <summary>Resets any action whose live bindings resolve to the given keyboard control.</summary>
+        private static void ResetActionsUsingControl(IEnumerable<InputAction> actions, InputControl control)
+        {
+            foreach (var action in actions)
+            {
+                if (action == null)
+                    continue;
+                var controls = action.controls;
+                for (int i = 0; i < controls.Count; i++)
+                {
+                    if (controls[i] == control)
+                    {
+                        action.Reset();
+                        break;
+                    }
+                }
+            }
         }
 
         private static bool IsTypingInTextField()
