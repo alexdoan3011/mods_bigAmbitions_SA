@@ -35,6 +35,8 @@ namespace SearchAnything
 
         private static Sprite _uiSprite;
         private static Sprite _roundedSprite;
+        private static Sprite _roundedBottomSprite;
+        private static Sprite _roundedTopSprite;
         private static Sprite _circleSprite;
 
         private static Sprite UiSprite()
@@ -138,6 +140,87 @@ namespace SearchAnything
                 new Vector2(0.5f, 0.5f), 100f, 0, SpriteMeshType.FullRect,
                 new Vector4(radius, radius, radius, radius));
             return _roundedSprite;
+        }
+
+        /// <summary>
+        /// A generated sprite rounded on the bottom two corners only (square top),
+        /// so a control can sit flush beneath the title bar.
+        /// </summary>
+        public static Sprite RoundedBottomSprite()
+        {
+            if (_roundedBottomSprite != null)
+                return _roundedBottomSprite;
+
+            const int size = 48;
+            const int radius = 10;
+            var tex = new Texture2D(size, size, TextureFormat.RGBA32, false)
+            {
+                wrapMode = TextureWrapMode.Clamp,
+                filterMode = FilterMode.Bilinear,
+            };
+            var pixels = new Color32[size * size];
+            for (int y = 0; y < size; y++)
+            {
+                for (int x = 0; x < size; x++)
+                {
+                    float alpha = 1f;
+                    // y == 0 is the bottom row; only round the bottom corners.
+                    if (y < radius && (x < radius || x > size - 1 - radius))
+                    {
+                        float cx = x < radius ? radius : size - 1 - radius;
+                        float dist = Mathf.Sqrt((x - cx) * (x - cx) + (y - radius) * (y - radius));
+                        alpha = Mathf.Clamp01(radius - dist + 0.5f);
+                    }
+                    pixels[y * size + x] = new Color32(255, 255, 255, (byte)(alpha * 255f));
+                }
+            }
+            tex.SetPixels32(pixels);
+            tex.Apply();
+            _roundedBottomSprite = Sprite.Create(tex, new Rect(0, 0, size, size),
+                new Vector2(0.5f, 0.5f), 100f, 0, SpriteMeshType.FullRect,
+                new Vector4(radius, radius, radius, radius));
+            return _roundedBottomSprite;
+        }
+
+        /// <summary>
+        /// A generated sprite rounded on the top two corners only (square bottom),
+        /// so the title bar can sit flush above the search bar.
+        /// </summary>
+        public static Sprite RoundedTopSprite()
+        {
+            if (_roundedTopSprite != null)
+                return _roundedTopSprite;
+
+            const int size = 48;
+            const int radius = 10;
+            var tex = new Texture2D(size, size, TextureFormat.RGBA32, false)
+            {
+                wrapMode = TextureWrapMode.Clamp,
+                filterMode = FilterMode.Bilinear,
+            };
+            var pixels = new Color32[size * size];
+            for (int y = 0; y < size; y++)
+            {
+                for (int x = 0; x < size; x++)
+                {
+                    float alpha = 1f;
+                    // y == size-1 is the top row; only round the top corners.
+                    if (y > size - 1 - radius && (x < radius || x > size - 1 - radius))
+                    {
+                        float cx = x < radius ? radius : size - 1 - radius;
+                        float cy = size - 1 - radius;
+                        float dist = Mathf.Sqrt((x - cx) * (x - cx) + (y - cy) * (y - cy));
+                        alpha = Mathf.Clamp01(radius - dist + 0.5f);
+                    }
+                    pixels[y * size + x] = new Color32(255, 255, 255, (byte)(alpha * 255f));
+                }
+            }
+            tex.SetPixels32(pixels);
+            tex.Apply();
+            _roundedTopSprite = Sprite.Create(tex, new Rect(0, 0, size, size),
+                new Vector2(0.5f, 0.5f), 100f, 0, SpriteMeshType.FullRect,
+                new Vector4(radius, radius, radius, radius));
+            return _roundedTopSprite;
         }
 
         /// <summary>A generated solid circle sprite.</summary>
@@ -376,8 +459,10 @@ namespace SearchAnything
             Stretch(viewportRt);
             var vpImg = viewport.AddComponent<Image>();
             vpImg.color = new Color(1f, 1f, 1f, 0.001f);
-            var mask = viewport.AddComponent<Mask>();
-            mask.showMaskGraphic = false;
+            // Use RectMask2D (rect clip) rather than a stencil Mask: the game's
+            // custom TMP font material does not render under UI stencil masking,
+            // which would make all list text invisible.
+            viewport.AddComponent<RectMask2D>();
 
             var content = Rect("Content", viewportRt, out var contentRt);
             contentRt.anchorMin = new Vector2(0f, 1f);
@@ -396,6 +481,44 @@ namespace SearchAnything
 
             var fitter = content.AddComponent<ContentSizeFitter>();
             fitter.verticalFit = ContentSizeFitter.FitMode.PreferredSize;
+
+            // Vertical scrollbar on the right edge (auto-hides + shrinks the
+            // viewport when the list overflows). Themed with the muted/accent
+            // colours so it matches the rest of the UI.
+            var sb = Rect("Scrollbar", rootRt, out var sbRt);
+            sbRt.anchorMin = new Vector2(1f, 0f);
+            sbRt.anchorMax = new Vector2(1f, 1f);
+            sbRt.pivot = new Vector2(1f, 1f);
+            sbRt.sizeDelta = new Vector2(10f, 0f);
+            // Nudge toward the panel edge so it isn't right up against the content.
+            sbRt.anchoredPosition = new Vector2(4f, 0f);
+            var sbImg = sb.AddComponent<Image>();
+            sbImg.sprite = RoundedSprite();
+            sbImg.type = Image.Type.Sliced;
+            // ppum 2 keeps the 9-slice corners within the 10px width so the ends
+            // render as rounded caps instead of pinched points.
+            sbImg.pixelsPerUnitMultiplier = 2f;
+            sbImg.color = new Color(1f, 1f, 1f, 0.06f);
+
+            var scrollbar = sb.AddComponent<Scrollbar>();
+            scrollbar.direction = Scrollbar.Direction.BottomToTop;
+
+            var slide = Rect("Sliding Area", sbRt, out var slideRt);
+            Stretch(slideRt);
+            var handle = Rect("Handle", slideRt, out var handleRt);
+            Stretch(handleRt);
+            var handleImg = handle.AddComponent<Image>();
+            handleImg.sprite = RoundedSprite();
+            handleImg.type = Image.Type.Sliced;
+            handleImg.pixelsPerUnitMultiplier = 2f;
+            handleImg.color = MutedColor;
+            scrollbar.handleRect = handleRt;
+            scrollbar.targetGraphic = handleImg;
+
+            scrollRect.verticalScrollbar = scrollbar;
+            scrollRect.verticalScrollbarVisibility = ScrollRect.ScrollbarVisibility.AutoHideAndExpandViewport;
+            // Positive spacing leaves a clear gap between the content and the bar.
+            scrollRect.verticalScrollbarSpacing = 6f;
 
             scrollRect.viewport = viewportRt;
             scrollRect.content = contentRt;

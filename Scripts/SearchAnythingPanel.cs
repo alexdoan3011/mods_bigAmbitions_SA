@@ -6,34 +6,48 @@ using UnityEngine.UI;
 namespace SearchAnything
 {
     /// <summary>
-    /// The Search Anything window. It is a clone of the real City Map filter
-    /// panel (so it inherits the game's frame, headline bar, scroll view and
-    /// fonts) with the game's filter behaviour stripped out and our own controls
-    /// — a search box, a list of matching products and the live list of shops
-    /// that sell the selected product — built into its scroll content.
+    /// The Search Anything UI. Rather than a fixed window, it is a set of small
+    /// floating, frameless panels on a top-most overlay canvas: a draggable
+    /// search bar, a results list that grows directly beneath it, and a "where to
+    /// find" list that appears to its right once a result is selected. Each list
+    /// is only as tall as its content (up to a cap, after which it scrolls), so
+    /// the mod's on-screen footprint stays as small as possible.
     /// </summary>
     public sealed class SearchAnythingPanel
     {
         private readonly SearchAnythingController _owner;
         private readonly Canvas _canvas;
 
-        private GameObject _window;
+        private RectTransform _group;
         private Canvas _overlayCanvas;
-        private RectTransform _content;
+        private RectTransform _resultsPanel;
+        private RectTransform _wherePanel;
         private RectTransform _productsContainer;
         private RectTransform _sellersContainer;
         private TextMeshProUGUI _sellersHeader;
         private TMP_InputField _searchInput;
+
+        private float _titleBarHeight = TitleHeight;
 
         private string _query = string.Empty;
 
         private const int MaxResultsShown = 80;
         private const int MaxSellersShown = 200;
 
-        public GameObject Root => _window;
+        // Floating layout sizes (kept compact so the mod's UI footprint stays small).
+        private const float SearchWidth = 540f;
+        private const float SearchHeight = 58f;
+        private const float TitleHeight = 56f;
+        private const float ResultsWidth = 540f;
+        private const float WhereWidth = 440f;
+        private const float Gap = 8f;
+        private const float HeaderHeight = 26f;
+        private const float PanelPad = 8f;
 
-        /// <summary>The window's RectTransform (null until first built).</summary>
-        public RectTransform WindowRect => _window != null ? _window.transform as RectTransform : null;
+        public GameObject Root => _group != null ? _group.gameObject : null;
+
+        /// <summary>The floating group's RectTransform (null until first built).</summary>
+        public RectTransform WindowRect => _group;
 
         public SearchAnythingPanel(SearchAnythingController owner, Canvas canvas)
         {
@@ -41,24 +55,24 @@ namespace SearchAnything
             _canvas = canvas;
         }
 
-        public bool IsVisible => _window != null && _window.activeSelf;
+        public bool IsVisible => _group != null && _group.gameObject.activeSelf;
 
         public void Show()
         {
-            if (_window == null)
+            if (_group == null)
                 Build();
-            if (_window == null)
+            if (_group == null)
                 return;
 
-            _window.SetActive(true);
+            _group.gameObject.SetActive(true);
             RebuildResults();
             RebuildWhereToFind();
         }
 
         public void Hide()
         {
-            if (_window != null)
-                _window.SetActive(false);
+            if (_group != null)
+                _group.gameObject.SetActive(false);
         }
 
         /// <summary>
@@ -85,54 +99,49 @@ namespace SearchAnything
 
         public void Destroy()
         {
-            if (_window != null)
-                Object.Destroy(_window);
-            _window = null;
+            if (_group != null)
+                Object.Destroy(_group.gameObject);
+            _group = null;
 
             if (_overlayCanvas != null)
                 Object.Destroy(_overlayCanvas.gameObject);
             _overlayCanvas = null;
         }
 
-        // -- Window construction (clone of the real panel) ------------------
+        // -- Floating UI construction ---------------------------------------
 
+        /// <summary>
+        /// Builds the floating, frameless UI: a draggable search bar with the
+        /// results list growing directly beneath it, and a "where to find" list
+        /// that appears to its right once a result is selected. Nothing is housed
+        /// in a fixed window, and each list is only as tall as its content (up to
+        /// a cap, after which it scrolls) so the mod's on-screen footprint stays
+        /// as small as possible.
+        /// </summary>
         private void Build()
         {
-            var source = _owner.PanelObject;
-            if (source == null)
-                return;
-
             // Guard against a destroyed/missing canvas (e.g. the city scene was
-            // reloaded); without this _canvas.transform throws an NRE.
+            // reloaded); without this we'd build onto nothing.
             if (_canvas == null)
                 return;
 
-            // Instantiate while parented to an inactive holder so none of the
-            // game's panel scripts (which would hide or repopulate it) ever run.
-            var holder = new GameObject("SA_Holder");
-            holder.SetActive(false);
+            var overlay = GetOverlayRoot();
+            if (overlay == null)
+                return;
 
-            _window = Object.Instantiate(source, holder.transform);
-            _window.name = "SearchAnythingWindow";
+            // The group is an invisible anchor near the top of the screen that all
+            // three floating pieces hang from; dragging the search bar moves it.
+            UiFactory.Rect("SearchAnythingGroup", overlay.transform, out _group);
+            _group.anchorMin = new Vector2(0.5f, 1f);
+            _group.anchorMax = new Vector2(0.5f, 1f);
+            _group.pivot = new Vector2(0.5f, 1f);
+            _group.sizeDelta = Vector2.zero;
+            _group.anchoredPosition = new Vector2(0f, -48f);
 
-            StripGameBehaviour();
-
-            // Re-home onto our own dedicated, top-most overlay canvas (built fresh
-            // so it isn't nested under the game's map canvas — a nested canvas
-            // can't out-sort UI on a higher sorting layer, which is why the window
-            // was being covered). Then drop the inactive holder.
-            _window.transform.SetParent(GetOverlayRoot().transform, false);
-            Object.Destroy(holder);
-
-            SetUpContent();
-            SetUpHeader();
-            SetUpDragging();
-            BuildCloseButton();
-
-            _window.SetActive(true);
-
-            BuildSections();
-            PositionWindow();
+            BuildTitleBar();
+            BuildSearchBar();
+            BuildResultsPanel();
+            BuildWherePanel();
         }
 
         /// <summary>
@@ -185,52 +194,60 @@ namespace SearchAnything
         }
 
         /// <summary>
-        /// Places the window at a deterministic centre-screen position with a
-        /// fixed size. The clone source (the City Map filter panel) may never have
-        /// been laid out by the game's draggable-window system when we open from
-        /// outside the map, so we can't trust its inherited geometry. Logs the
-        /// resulting rect so layout issues can be diagnosed from the player log.
+        /// Makes the whole floating group draggable from the search bar's
+        /// background, so the player can reposition the search-and-results stack
+        /// anywhere on screen.
         /// </summary>
-        private void PositionWindow()
+        private void SetUpDragging(GameObject handle)
         {
-            var rt = _window.transform as RectTransform;
-            if (rt == null)
-                return;
+            var graphic = handle.GetComponent<Graphic>();
+            if (graphic != null)
+                graphic.raycastTarget = true;
 
-            rt.anchorMin = new Vector2(0.5f, 0.5f);
-            rt.anchorMax = new Vector2(0.5f, 0.5f);
-            rt.pivot = new Vector2(0.5f, 0.5f);
-
-            // Size relative to the canvas so the window is large on any screen
-            // while still leaving a margin around it.
-            float w = 820f, h = 1000f;
-            var sizeCanvas = _overlayCanvas != null ? _overlayCanvas : _canvas;
-            var canvasRt = sizeCanvas != null ? sizeCanvas.transform as RectTransform : null;
-            if (canvasRt != null && canvasRt.rect.width > 1f && canvasRt.rect.height > 1f)
-            {
-                w = Mathf.Clamp(canvasRt.rect.width * 0.46f, 760f, 1000f);
-                h = Mathf.Clamp(canvasRt.rect.height * 0.94f, 820f, 1400f);
-            }
-            rt.sizeDelta = new Vector2(w, h);
-            rt.anchoredPosition = Vector2.zero;
-            rt.localScale = Vector3.one;
-
-            var parentCanvas = _canvas;
-            Debug.Log(
-                $"[Mod:SearchAnything] window geometry: active={_window.activeInHierarchy} " +
-                $"sizeDelta={rt.sizeDelta} anchoredPos={rt.anchoredPosition} rect={rt.rect} " +
-                $"parentCanvas={(parentCanvas != null ? parentCanvas.name : "null")} " +
-                $"renderMode={(parentCanvas != null ? parentCanvas.renderMode.ToString() : "n/a")}");
+            var drag = handle.AddComponent<WindowDragHandler>();
+            drag.Target = _group;
+            drag.Canvas = _overlayCanvas != null ? _overlayCanvas : _canvas;
         }
 
         /// <summary>
-        /// A rounded square close (X) button on the headline's right edge.
+        /// Builds a simple, self-made title bar above the search box (we no longer
+        /// clone the game headline — that proved fragile). It is styled as a light
+        /// header to sit with the game's theme, shows "SEARCH ANYTHING", and acts
+        /// as the grab handle. The game UI is still cloned, but only for the text
+        /// input field itself.
         /// </summary>
-        private void BuildCloseButton()
+        private void BuildTitleBar()
         {
-            var headline = UiFactory.FindDeep(_window.transform, "Headline");
-            var parent = headline != null ? headline : _window.transform;
+            _titleBarHeight = TitleHeight;
 
+            var headerColor = new Color(0.82f, 0.85f, 0.90f, 1f);
+            var img = UiFactory.Panel("TitleBar", _group, headerColor, out var rt);
+            img.sprite = UiFactory.RoundedTopSprite();
+            img.type = Image.Type.Sliced;
+            img.pixelsPerUnitMultiplier = 1f;
+            img.raycastTarget = true;
+            rt.anchorMin = new Vector2(0.5f, 1f);
+            rt.anchorMax = new Vector2(0.5f, 1f);
+            rt.pivot = new Vector2(0.5f, 1f);
+            rt.sizeDelta = new Vector2(SearchWidth, _titleBarHeight);
+            rt.anchoredPosition = Vector2.zero;
+
+            var label = UiFactory.Text("SEARCH ANYTHING", rt, 22f,
+                UiFactory.ControlTextColor, TextAlignmentOptions.MidlineLeft);
+            label.fontStyle = FontStyles.Bold;
+            var lrt = label.rectTransform;
+            lrt.anchorMin = Vector2.zero;
+            lrt.anchorMax = Vector2.one;
+            lrt.offsetMin = new Vector2(16f, 0f);
+            lrt.offsetMax = new Vector2(-58f, 0f);
+
+            SetUpDragging(img.gameObject);
+            AddCloseButton(img.transform);
+        }
+
+        /// <summary>A red close (X) button anchored to the right of the title bar.</summary>
+        private void AddCloseButton(Transform parent)
+        {
             var img = UiFactory.Panel("CloseButton", parent, new Color(0.78f, 0.16f, 0.16f, 1f), out var rt);
             img.sprite = UiFactory.RoundedSprite();
             img.type = Image.Type.Sliced;
@@ -241,210 +258,52 @@ namespace SearchAnything
             rt.anchorMin = new Vector2(1f, 0.5f);
             rt.anchorMax = new Vector2(1f, 0.5f);
             rt.pivot = new Vector2(1f, 0.5f);
-            rt.sizeDelta = new Vector2(50f, 50f);
-            rt.anchoredPosition = new Vector2(-24f, 0f);
+            rt.sizeDelta = new Vector2(42f, 42f);
+            rt.anchoredPosition = new Vector2(-10f, 0f);
             rt.SetAsLastSibling();
 
             var btn = img.gameObject.AddComponent<Button>();
             btn.targetGraphic = img;
-            var x = UiFactory.Text("X", img.transform, 24f, UiFactory.TextColor, TextAlignmentOptions.Center);
+            var x = UiFactory.Text("X", img.transform, 26f, UiFactory.TextColor, TextAlignmentOptions.Center);
             UiFactory.Stretch(x.rectTransform);
             btn.onClick.AddListener(() => _owner.RequestClose());
         }
 
-        /// <summary>Removes the game's filter logic and leftover contents from the clone.</summary>
-        private void StripGameBehaviour()
-        {
-            var cmf = _window.GetComponent<CityMapFilters>();
-            if (cmf != null)
-            {
-                RemoveCloseButton(cmf);
-                Object.DestroyImmediate(cmf);
-            }
-
-            // Drop our own injected headline button if it got cloned along.
-            foreach (var t in _window.GetComponentsInChildren<Transform>(true))
-            {
-                if (t != null && t != _window.transform && t.name == "SearchAnythingButton")
-                {
-                    Object.DestroyImmediate(t.gameObject);
-                    break;
-                }
-            }
-
-            // Remove the vanilla top controls (search box + enable-all switch).
-            var topControls = UiFactory.FindDeep(_window.transform, "Top Controls");
-            if (topControls != null)
-                Object.DestroyImmediate(topControls.gameObject);
-
-            // Sweep up any leftover game buttons that live outside the scroll
-            // content (e.g. the orange "Close" bar at the bottom). Our own
-            // controls are built later, so nothing we need exists yet.
-            var scrollContent = _window.GetComponentInChildren<ScrollRect>(true)?.content;
-            foreach (var btn in _window.GetComponentsInChildren<Button>(true))
-            {
-                if (btn == null || btn.transform == _window.transform)
-                    continue;
-                if (scrollContent != null && btn.transform.IsChildOf(scrollContent))
-                    continue;
-                Object.DestroyImmediate(btn.gameObject);
-            }
-
-            // Stop localized labels from overwriting our custom text.
-            UiFactory.DisableLocalization(_window);
-        }
-
         /// <summary>
-        /// Removes the panel's "Close Voogle Maps [ESC]" button, found via the
-        /// game's private <c>closeLabel</c> reference on the cloned component.
+        /// Builds the floating search bar (rounded background + search field +
+        /// close button), anchored just below the title bar.
         /// </summary>
-        private void RemoveCloseButton(CityMapFilters cmf)
+        private void BuildSearchBar()
         {
-            var field = typeof(CityMapFilters).GetField(
-                "closeLabel",
-                System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
-            if (field == null)
-                return;
+            var barImg = UiFactory.Panel("SearchBar", _group, UiFactory.PanelColor, out var barRt);
+            // Square top so the bar sits flush under the title bar; rounded bottom.
+            barImg.sprite = UiFactory.RoundedBottomSprite();
+            barImg.type = Image.Type.Sliced;
+            barImg.pixelsPerUnitMultiplier = 1f;
+            barImg.raycastTarget = true;
+            barRt.anchorMin = new Vector2(0.5f, 1f);
+            barRt.anchorMax = new Vector2(0.5f, 1f);
+            barRt.pivot = new Vector2(0.5f, 1f);
+            barRt.sizeDelta = new Vector2(SearchWidth, SearchHeight);
+            barRt.anchoredPosition = new Vector2(0f, -_titleBarHeight);
 
-            if (field.GetValue(cmf) is Component label && label != null)
-            {
-                var button = label.GetComponentInParent<Button>();
-                var target = button != null ? button.gameObject : label.gameObject;
-                Object.DestroyImmediate(target);
-            }
-        }
+            var hl = barImg.gameObject.AddComponent<HorizontalLayoutGroup>();
+            hl.childControlWidth = true;
+            hl.childControlHeight = true;
+            hl.childForceExpandWidth = false;
+            hl.childForceExpandHeight = true;
+            hl.childAlignment = TextAnchor.MiddleLeft;
+            hl.spacing = 8f;
+            hl.padding = new RectOffset(10, 10, 8, 8);
 
-        private void SetUpContent()
-        {
-            var scroll = _window.GetComponentInChildren<ScrollRect>(true);
-            _content = scroll != null ? scroll.content : null;
-            if (_content == null)
-                return;
-
-            // Tighten the window margins so content isn't floating in the middle
-            // of a large frame. Leave room at the top for the headline bar.
-            var scrollRt = scroll.GetComponent<RectTransform>();
-            if (scrollRt != null)
-            {
-                float topInset = 64f;
-                if (UiFactory.FindDeep(_window.transform, "Headline") is RectTransform headlineRt
-                    && headlineRt.rect.height > 1f)
-                    topInset = headlineRt.rect.height + 6f;
-
-                scrollRt.anchorMin = Vector2.zero;
-                scrollRt.anchorMax = Vector2.one;
-                scrollRt.offsetMin = new Vector2(20f, 20f);
-                scrollRt.offsetMax = new Vector2(-20f, -topInset);
-                if (scroll.viewport != null)
-                    UiFactory.Stretch(scroll.viewport);
-            }
-
-            // Normalise the cloned content so it spans the viewport edge-to-edge.
-            _content.anchorMin = new Vector2(0f, _content.anchorMin.y);
-            _content.anchorMax = new Vector2(1f, _content.anchorMax.y);
-            _content.offsetMin = new Vector2(0f, _content.offsetMin.y);
-            _content.offsetMax = new Vector2(0f, _content.offsetMax.y);
-
-            // Clear the cloned filter rows / templates.
-            for (int i = _content.childCount - 1; i >= 0; i--)
-                Object.DestroyImmediate(_content.GetChild(i).gameObject);
-
-            var vlg = _content.GetComponent<VerticalLayoutGroup>();
-            if (vlg == null)
-                vlg = _content.gameObject.AddComponent<VerticalLayoutGroup>();
-            vlg.childControlWidth = true;
-            vlg.childControlHeight = true;
-            vlg.childForceExpandWidth = true;
-            vlg.childForceExpandHeight = false;
-            vlg.spacing = 6f;
-            vlg.padding = new RectOffset(2, 2, 4, 4);
-
-            var fitter = _content.GetComponent<ContentSizeFitter>();
-            if (fitter == null)
-                fitter = _content.gameObject.AddComponent<ContentSizeFitter>();
-            fitter.verticalFit = ContentSizeFitter.FitMode.PreferredSize;
-        }
-
-        private void SetUpHeader()
-        {
-            var headline = UiFactory.FindDeep(_window.transform, "Headline");
-            if (headline == null)
-                return;
-
-            // Keep the cloned label's original colour (dark, to suit the light
-            // headline bar) — only change the text.
-            var label = headline.GetComponentInChildren<TextMeshProUGUI>(true);
-            if (label != null)
-            {
-                label.text = "SEARCH ANYTHING";
-                label.fontStyle = FontStyles.Normal;
-            }
-        }
-
-        private void SetUpDragging()
-        {
-            var headline = UiFactory.FindDeep(_window.transform, "Headline");
-            var handleTarget = headline != null ? headline.gameObject : _window;
-
-            var graphic = handleTarget.GetComponent<Graphic>();
-            if (graphic != null)
-            {
-                graphic.raycastTarget = true;
-            }
-            else
-            {
-                var hit = handleTarget.AddComponent<Image>();
-                hit.color = new Color(1f, 1f, 1f, 0.004f);
-                hit.raycastTarget = true;
-            }
-
-            var drag = handleTarget.AddComponent<WindowDragHandler>();
-            drag.Target = _window.GetComponent<RectTransform>();
-            drag.Canvas = _overlayCanvas != null ? _overlayCanvas : _canvas;
-        }
-
-        private void BuildSections()
-        {
-            if (_content == null)
-                return;
-
-            BuildSearchRow();
-
-            var productsLabel = UiFactory.Text("Results", _content, 23f, UiFactory.TextColor);
-            UiFactory.SetSize(productsLabel.gameObject, null, 28f);
-
-            _productsContainer = BuildContainer("Products");
-
-            _sellersHeader = UiFactory.Text("Where to find", _content, 23f, UiFactory.TextColor);
-            UiFactory.SetSize(_sellersHeader.gameObject, null, 28f);
-
-            _sellersContainer = BuildContainer("SellersList");
-        }
-
-        private RectTransform BuildContainer(string name)
-        {
-            UiFactory.Rect(name, _content, out var rt);
-            var vlg = rt.gameObject.AddComponent<VerticalLayoutGroup>();
-            vlg.childControlWidth = true;
-            vlg.childControlHeight = true;
-            vlg.childForceExpandWidth = true;
-            vlg.childForceExpandHeight = false;
-            vlg.spacing = 5f;
-
-            var fitter = rt.gameObject.AddComponent<ContentSizeFitter>();
-            fitter.verticalFit = ContentSizeFitter.FitMode.PreferredSize;
-            return rt;
-        }
-
-        private void BuildSearchRow()
-        {
-            _searchInput = UiFactory.SearchInput(_content, "Search for anything...", query =>
+            // Search field fills the bar (the close button now lives in the title bar).
+            _searchInput = UiFactory.SearchInput(barImg.transform, "Search for anything...", query =>
             {
                 _query = query ?? string.Empty;
                 RebuildResults();
                 RebuildWhereToFind();
             });
-            UiFactory.SetSize(_searchInput.gameObject, null, 56f);
+            UiFactory.SetWidth(_searchInput.gameObject, null, 1f);
 
             // Put the field on the UI layer so the game treats it as a focused UI
             // input and suppresses its own keyboard shortcuts / player movement
@@ -455,6 +314,90 @@ namespace SearchAnything
                 _searchInput.gameObject.layer = uiLayer;
         }
 
+        /// <summary>Builds the results list panel directly beneath the search bar.</summary>
+        private void BuildResultsPanel()
+        {
+            _resultsPanel = BuildFloatingList("Results", ResultsWidth, out _productsContainer, out _);
+            _resultsPanel.anchorMin = new Vector2(0.5f, 1f);
+            _resultsPanel.anchorMax = new Vector2(0.5f, 1f);
+            _resultsPanel.pivot = new Vector2(0.5f, 1f);
+            _resultsPanel.anchoredPosition = new Vector2(0f, -(_titleBarHeight + SearchHeight + Gap));
+        }
+
+        /// <summary>
+        /// Builds the "where to find" panel that floats to the right of the
+        /// results list. Stays hidden until a result is selected.
+        /// </summary>
+        private void BuildWherePanel()
+        {
+            _wherePanel = BuildFloatingList("Where to find", WhereWidth, out _sellersContainer, out _sellersHeader);
+            _wherePanel.anchorMin = new Vector2(0.5f, 1f);
+            _wherePanel.anchorMax = new Vector2(0.5f, 1f);
+            _wherePanel.pivot = new Vector2(0f, 1f);
+            _wherePanel.anchoredPosition = new Vector2(ResultsWidth * 0.5f + Gap, -(_titleBarHeight + SearchHeight + Gap));
+            _wherePanel.gameObject.SetActive(false);
+        }
+
+        /// <summary>
+        /// Builds a frameless floating list panel: a rounded background, a small
+        /// header label and a scroll view whose content the caller fills. The
+        /// panel height is set dynamically by <see cref="FitPanel"/> so it is only
+        /// as tall as its content (up to a cap, after which it scrolls).
+        /// </summary>
+        private RectTransform BuildFloatingList(string title, float width, out RectTransform content, out TextMeshProUGUI header)
+        {
+            var panelImg = UiFactory.Panel(title + "Panel", _group, UiFactory.PanelColor, out var panelRt);
+            panelImg.sprite = UiFactory.RoundedSprite();
+            panelImg.type = Image.Type.Sliced;
+            panelImg.pixelsPerUnitMultiplier = 1f;
+            panelRt.sizeDelta = new Vector2(width, HeaderHeight + 2f * PanelPad);
+
+            header = UiFactory.Text(title, panelRt, 17f, UiFactory.MutedColor);
+            var headerRt = header.rectTransform;
+            headerRt.anchorMin = new Vector2(0f, 1f);
+            headerRt.anchorMax = new Vector2(1f, 1f);
+            headerRt.pivot = new Vector2(0.5f, 1f);
+            headerRt.sizeDelta = new Vector2(-2f * PanelPad - 4f, HeaderHeight);
+            headerRt.anchoredPosition = new Vector2(0f, -PanelPad);
+
+            var contentRt = UiFactory.ScrollView(title + "Scroll", panelRt, out _, out var scrollRoot);
+            scrollRoot.anchorMin = Vector2.zero;
+            scrollRoot.anchorMax = Vector2.one;
+            scrollRoot.offsetMin = new Vector2(PanelPad, PanelPad);
+            scrollRoot.offsetMax = new Vector2(-PanelPad, -(PanelPad + HeaderHeight + 4f));
+
+            content = contentRt;
+            return panelRt;
+        }
+
+        /// <summary>
+        /// Sizes a floating list panel to its content height (clamped to a cap so
+        /// long lists scroll instead of filling the screen), keeping the mod's
+        /// footprint as small as the current results allow.
+        /// </summary>
+        private void FitPanel(RectTransform panel, RectTransform content)
+        {
+            if (panel == null || content == null)
+                return;
+
+            Canvas.ForceUpdateCanvases();
+            LayoutRebuilder.ForceRebuildLayoutImmediate(content);
+            float contentH = LayoutUtility.GetPreferredHeight(content);
+
+            float maxList = Mathf.Max(160f, ScreenHeight() * 0.6f);
+            float listH = Mathf.Clamp(contentH, 0f, maxList);
+            panel.sizeDelta = new Vector2(panel.sizeDelta.x, HeaderHeight + listH + 2f * PanelPad + 4f);
+        }
+
+        /// <summary>Height of the overlay canvas (falls back to the screen height).</summary>
+        private float ScreenHeight()
+        {
+            var canvasRt = _overlayCanvas != null ? _overlayCanvas.transform as RectTransform : null;
+            if (canvasRt != null && canvasRt.rect.height > 1f)
+                return canvasRt.rect.height;
+            return Screen.height;
+        }
+
         // -- Results list (products + places) -------------------------------
 
         public void RebuildResults()
@@ -463,16 +406,17 @@ namespace SearchAnything
                 return;
 
             for (int i = _productsContainer.childCount - 1; i >= 0; i--)
-                Object.Destroy(_productsContainer.GetChild(i).gameObject);
+                Object.DestroyImmediate(_productsContainer.GetChild(i).gameObject);
 
             if (string.IsNullOrWhiteSpace(_query))
             {
                 var hint = UiFactory.Text(
-                    $"Start typing to search. {_owner.TotalIndexed} items indexed across the city.",
+                    $"{_owner.TotalIndexed} items indexed",
                     _productsContainer, 18f, UiFactory.MutedColor);
                 UiFactory.SetSize(hint.gameObject, null, 30f);
                 hint.alignment = TextAlignmentOptions.MidlineLeft;
                 hint.enableWordWrapping = true;
+                FitPanel(_resultsPanel, _productsContainer);
                 return;
             }
 
@@ -481,6 +425,7 @@ namespace SearchAnything
             {
                 var none = UiFactory.Text("No matches found.", _productsContainer, 18f, UiFactory.MutedColor);
                 UiFactory.SetSize(none.gameObject, null, 30f);
+                FitPanel(_resultsPanel, _productsContainer);
                 return;
             }
 
@@ -498,6 +443,8 @@ namespace SearchAnything
                     _productsContainer, 16f, UiFactory.MutedColor);
                 UiFactory.SetSize(more.gameObject, null, 26f);
             }
+
+            FitPanel(_resultsPanel, _productsContainer);
         }
 
         private void BuildResultRow(SearchResult result)
@@ -554,9 +501,10 @@ namespace SearchAnything
             }
             else
             {
-                // Place: name on top with a detail line below (size, type,
-                // neighbourhood and who owns/rents it) so the player can see why
-                // it matched. The matching text is highlighted live as they type.
+                // Place: name on top, then a detail line (size, type,
+                // neighbourhood) and a separate ownership line below — these don't
+                // fit on one line in the narrow panel. Matching text is
+                // highlighted live as the player types.
                 var block = UiFactory.Rect("Text", rowImg.transform, out _);
                 var bvlg = block.AddComponent<VerticalLayoutGroup>();
                 bvlg.childControlWidth = true;
@@ -570,12 +518,24 @@ namespace SearchAnything
                 var name = UiFactory.Text(Highlight(result.DisplayName), block.transform, 18f, UiFactory.TextColor);
                 UiFactory.SetSize(name.gameObject, null, 22f);
 
+                float rowHeight = 8f + 22f;
+
                 string detail = BuildLocationDetail(result);
                 if (!string.IsNullOrEmpty(detail))
                 {
                     var detailText = UiFactory.Text(Highlight(detail), block.transform, 14f, UiFactory.MutedColor);
                     UiFactory.SetSize(detailText.gameObject, null, 18f);
+                    rowHeight += 18f;
                 }
+
+                if (!string.IsNullOrEmpty(result.Ownership))
+                {
+                    var ownerText = UiFactory.Text(Highlight(result.Ownership), block.transform, 14f, UiFactory.MutedColor);
+                    UiFactory.SetSize(ownerText.gameObject, null, 18f);
+                    rowHeight += 18f;
+                }
+
+                UiFactory.SetSize(rowImg.gameObject, null, Mathf.Max(52f, rowHeight));
             }
 
             // Clicking a result only selects it (filling the bottom list). Jumping
@@ -589,18 +549,16 @@ namespace SearchAnything
             });
         }
 
-        /// <summary>Builds the place's detail line: size, type, neighbourhood and ownership.</summary>
+        /// <summary>Builds the place's detail line: size, type and neighbourhood (ownership is shown separately).</summary>
         private static string BuildLocationDetail(SearchResult r)
         {
-            var parts = new List<string>(4);
+            var parts = new List<string>(3);
             if (!string.IsNullOrEmpty(r.SizeCode))
                 parts.Add(r.SizeCode);
             if (!string.IsNullOrEmpty(r.TypeLabel))
                 parts.Add(r.TypeLabel);
             if (!string.IsNullOrEmpty(r.Neighbourhood))
                 parts.Add(r.Neighbourhood);
-            if (!string.IsNullOrEmpty(r.Ownership))
-                parts.Add(r.Ownership);
             return string.Join("  \u00b7  ", parts);
         }
 
@@ -665,17 +623,18 @@ namespace SearchAnything
                 return;
 
             for (int i = _sellersContainer.childCount - 1; i >= 0; i--)
-                Object.Destroy(_sellersContainer.GetChild(i).gameObject);
+                Object.DestroyImmediate(_sellersContainer.GetChild(i).gameObject);
 
+            // No selection: hide the panel entirely so it takes up no space.
             if (string.IsNullOrEmpty(_owner.SelectedId))
             {
-                if (_sellersHeader != null)
-                    _sellersHeader.text = "Where to find";
-                var hint = UiFactory.Text("Select a result to see where it is.",
-                    _sellersContainer, 18f, UiFactory.MutedColor);
-                UiFactory.SetSize(hint.gameObject, null, 30f);
+                if (_wherePanel != null)
+                    _wherePanel.gameObject.SetActive(false);
                 return;
             }
+
+            if (_wherePanel != null)
+                _wherePanel.gameObject.SetActive(true);
 
             var places = _owner.WhereToFind;
             if (_sellersHeader != null)
@@ -686,12 +645,15 @@ namespace SearchAnything
                 var none = UiFactory.Text("No locations found.",
                     _sellersContainer, 18f, UiFactory.MutedColor);
                 UiFactory.SetSize(none.gameObject, null, 30f);
+                FitPanel(_wherePanel, _sellersContainer);
                 return;
             }
 
             int max = Mathf.Min(places.Count, MaxSellersShown);
             for (int i = 0; i < max; i++)
                 BuildSellerRow(places[i]);
+
+            FitPanel(_wherePanel, _sellersContainer);
         }
 
         private void BuildSellerRow(SellerInfo seller)
