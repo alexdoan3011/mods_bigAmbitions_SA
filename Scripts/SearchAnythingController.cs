@@ -33,6 +33,17 @@ namespace SearchAnything
         // product key -> the shops that sell it
         private readonly Dictionary<string, List<SellerInfo>> _sellersByProduct = new();
         private readonly List<ProductInfo> _products = new();
+
+        // Vehicle products are keyed by their showcase item name (e.g.
+        // "ba:itemname_mersaididashshowcase"), but their display name and price
+        // come from the linked VehicleType ("ba:vehicletype_mersaididash"), not
+        // the item's own market data. _vehicleSearchByItem holds extra keywords
+        // ("vehicle", the vehicle category and its features) so vehicles can be
+        // found by more than just their name.
+        private readonly Dictionary<string, string> _vehicleNameByItem = new();
+        private readonly Dictionary<string, float> _vehiclePriceByItem = new();
+        private readonly Dictionary<string, string> _vehicleSearchByItem = new();
+        private readonly Dictionary<string, string> _vehicleDetailByItem = new();
         private readonly List<LocationEntry> _locations = new();
         private readonly Dictionary<string, Sprite> _iconCache = new();
 
@@ -139,8 +150,11 @@ namespace SearchAnything
             // Products first so they stay visible even when many places match.
             foreach (var product in _products)
             {
-                string text = ((product.DisplayName ?? string.Empty) + " " + (product.ItemName ?? string.Empty))
-                    .ToLowerInvariant();
+                // For vehicles, also match the extra keywords ("vehicle", the
+                // category and features) collected during the scan.
+                string extra = _vehicleSearchByItem.TryGetValue(product.ItemName ?? string.Empty, out var v) ? v : string.Empty;
+                string text = ((product.DisplayName ?? string.Empty) + " " +
+                    (product.ItemName ?? string.Empty) + " " + extra).ToLowerInvariant();
                 if (!MatchesAll(text, tokens))
                     continue;
 
@@ -152,6 +166,7 @@ namespace SearchAnything
                     ItemName = product.ItemName,
                     Price = product.Price,
                     SellerCount = product.SellerCount,
+                    Detail = _vehicleDetailByItem.TryGetValue(product.ItemName ?? string.Empty, out var d) ? d : null,
                 });
             }
 
@@ -228,11 +243,33 @@ namespace SearchAnything
                 return cached;
 
             Sprite icon = null;
-            try { icon = ItemHelper.GetIconWithFallback(itemName); }
-            catch { /* missing addressable; leave null */ }
+
+            // Vehicles have no per-item 2D icon (their art is a 3D showcase model,
+            // so ItemHelper falls back to a cardboard box). Use the game's generic
+            // vehicle icon instead so dealership stock reads as a vehicle.
+            if (_vehicleNameByItem.ContainsKey(itemName))
+            {
+                icon = GetVehicleIcon();
+            }
+            else
+            {
+                try { icon = ItemHelper.GetIconWithFallback(itemName); }
+                catch { /* missing addressable; leave null */ }
+            }
 
             _iconCache[itemName] = icon;
             return icon;
+        }
+
+        /// <summary>The game's generic vehicle icon, shared by all vehicle products.</summary>
+        private static Sprite GetVehicleIcon()
+        {
+            try
+            {
+                var refs = InstanceBehavior<GlobalReferences>.Instance;
+                return refs != null ? refs.vehiclePOIIcon : null;
+            }
+            catch { return null; }
         }
 
         /// <summary>The map-pin icon a place would use (its business or building type icon).</summary>
@@ -526,6 +563,10 @@ namespace SearchAnything
         {
             _products.Clear();
             _sellersByProduct.Clear();
+            _vehicleNameByItem.Clear();
+            _vehiclePriceByItem.Clear();
+            _vehicleSearchByItem.Clear();
+            _vehicleDetailByItem.Clear();
             _locations.Clear();
             _selectedId = null;
             _whereToFind.Clear();
@@ -671,6 +712,18 @@ namespace SearchAnything
                     continue;
                 }
 
+                // (b3) Car dealerships sell vehicles (e.g. the Mersaidi Dash).
+                // Their stock is not in cachedAvailableProducts and is filtered
+                // out by GetListOfItemsForSale (dealerships have no walk-in
+                // customer type), so read the business layout set directly and
+                // keep the "showcase" items that map to a VehicleType — mirroring
+                // the game's own PurchaseVehicle logic.
+                if (businessKey == "ba:businesstype_cardealership")
+                {
+                    IndexDealershipVehicles(controller, reg, building, name, hood);
+                    continue;
+                }
+
                 // (c) Product sellers for buildings that offer products.
                 var products = reg.cachedAvailableProducts;
                 if (products == null || products.Count == 0)
@@ -708,16 +761,80 @@ namespace SearchAnything
                     return n != 0 ? n : string.Compare(a.DisplayName, b.DisplayName, System.StringComparison.OrdinalIgnoreCase);
                 });
 
+                bool isVehicle = _vehicleNameByItem.TryGetValue(kv.Key, out var vehicleName);
                 _products.Add(new ProductInfo
                 {
                     ItemName = kv.Key,
-                    DisplayName = LabelText.Prettify(kv.Key),
+                    DisplayName = isVehicle ? vehicleName : LabelText.Prettify(kv.Key),
                     SellerCount = kv.Value.Count,
-                    Price = SafeMarketPrice(kv.Key),
+                    Price = isVehicle ? _vehiclePriceByItem[kv.Key] : SafeMarketPrice(kv.Key),
                 });
             }
 
             _products.Sort((a, b) => string.Compare(a.DisplayName, b.DisplayName, System.StringComparison.OrdinalIgnoreCase));
+
+            _context?.Logger.Info(
+                $"SearchAnything: indexed {_products.Count} products ({_vehicleNameByItem.Count} vehicles) and {_locations.Count} locations.");
+        }
+
+        /// <summary>
+        /// Indexes the vehicles a car dealership offers. Dealership stock is not
+        /// held in <c>cachedAvailableProducts</c> (and GetListOfItemsForSale
+        /// discards it because dealerships have no walk-in customer type), so the
+        /// business layout set is loaded directly and every enabled "player item
+        /// purchaser" that resolves to a VehicleType is added as a sellable
+        /// vehicle — the same source the game's PurchaseVehicle dialog reads.
+        /// </summary>
+        private void IndexDealershipVehicles(
+            CityBuildingController controller, BuildingRegistration reg, Buildings.Building building,
+            string name, string hood)
+        {
+            try
+            {
+                if (building == null || string.IsNullOrEmpty(reg.Layout))
+                    return;
+
+                var layoutSet = BusinessLayoutSets.BusinessLayoutSetHelper.GetOrLoadBusinessLayoutSet(
+                    reg.businessTypeName, new Blueprints.BuildingSizeInfo(building), reg.Layout.ToLower(), false);
+                if (layoutSet?.Items == null)
+                    return;
+
+                foreach (var layoutItem in layoutSet.Items)
+                {
+                    var purchaser = layoutItem?.playerItemPurchaserSettings;
+                    if (purchaser == null || !purchaser.enabled || string.IsNullOrEmpty(purchaser.itemName))
+                        continue;
+
+                    var item = BigAmbitions.Items.ItemsGetter.GetByName(purchaser.itemName);
+                    if (item == null || string.IsNullOrEmpty(item.vehicleType))
+                        continue;
+
+                    var vehicleType = Vehicles.VehicleTypes.VehicleTypeHelper.GetVehicleType(item.vehicleType);
+
+                    string itemName = purchaser.itemName;
+                    if (!_sellersByProduct.TryGetValue(itemName, out var sellers))
+                    {
+                        sellers = new List<SellerInfo>();
+                        _sellersByProduct[itemName] = sellers;
+                    }
+                    sellers.Add(new SellerInfo
+                    {
+                        Controller = controller,
+                        DisplayName = name,
+                        Neighbourhood = hood,
+                        Price = VehicleTypePrice(vehicleType),
+                    });
+
+                    _vehicleNameByItem[itemName] = LabelText.Prettify(item.vehicleType);
+                    _vehiclePriceByItem[itemName] = VehicleTypePrice(vehicleType);
+                    _vehicleSearchByItem[itemName] = BuildVehicleSearchTerms(vehicleType);
+                    _vehicleDetailByItem[itemName] = BuildVehicleDetail(vehicleType);
+                }
+            }
+            catch (System.Exception e)
+            {
+                _context?.Logger.Info($"SearchAnything: dealership scan failed ({e.Message}).");
+            }
         }
 
         private static string SafeSellerName(BuildingRegistration reg)
@@ -845,6 +962,122 @@ namespace SearchAnything
                 return price > 0f ? price : -1f;
             }
             catch { return -1f; }
+        }
+
+        /// <summary>The purchase price of a vehicle type, or negative when unknown.</summary>
+        private static float VehicleTypePrice(Vehicles.VehicleTypes.VehicleType vehicleType)
+        {
+            try
+            {
+                return vehicleType != null && vehicleType.price > 0f ? vehicleType.price : -1f;
+            }
+            catch { return -1f; }
+        }
+
+        /// <summary>
+        /// Builds a blob of extra search keywords for a vehicle so it can be found
+        /// by more than its name: the word "vehicle", its category (car, truck,
+        /// scooter, hand truck) and a handful of features (motorised, cargo, tax
+        /// deductible, auto-park, radio, enclosed, tow-fit).
+        /// </summary>
+        private static string BuildVehicleSearchTerms(Vehicles.VehicleTypes.VehicleType vehicleType)
+        {
+            var sb = new System.Text.StringBuilder(" vehicle");
+            if (vehicleType == null)
+                return sb.ToString();
+
+            // Category, taken from the vehicle's tags. "Car" is omitted because
+            // it is the default kind shared by almost every vehicle, so it does
+            // not help narrow a search.
+            try
+            {
+                if (vehicleType.HasTag(BigAmbitions.Tags.TagRef.Vehicletag.istruck))
+                    sb.Append(" truck lorry");
+                else if (vehicleType.HasTag(BigAmbitions.Tags.TagRef.Vehicletag.isscooter))
+                    sb.Append(" scooter moped bike");
+                else if (vehicleType.HasTag(BigAmbitions.Tags.TagRef.Vehicletag.ishandvehicle))
+                    sb.Append(" hand truck handtruck cart trolley");
+            }
+            catch { /* tag database unavailable */ }
+
+            // Distinguishing features only (radio and enclosed are shared by
+            // essentially every vehicle, so they are left out).
+            try
+            {
+                sb.Append(vehicleType.IsMotorVehicle ? " motorised motorized fuel" : " manual non-motorised");
+                if (vehicleType.maxCargoCapacity > 0)
+                    sb.Append(" cargo storage slots ").Append(vehicleType.maxCargoCapacity);
+                if (vehicleType.taxDeductible)
+                    sb.Append(" tax deductible business");
+                if (vehicleType.autoParkSupported)
+                    sb.Append(" auto park autopark self-parking");
+                if (vehicleType.fitsHandTruck)
+                    sb.Append(" fits hand truck");
+                if (vehicleType.fitsFlatbed)
+                    sb.Append(" fits flatbed");
+            }
+            catch { /* stats unavailable */ }
+
+            return sb.ToString();
+        }
+
+        /// <summary>
+        /// Builds the human-readable descriptor lines for a vehicle — its category
+        /// and distinguishing features — shown under the result so the player can
+        /// see why it matched. Traits shared by every vehicle (car, radio,
+        /// enclosed) are omitted. A few tags are packed onto each line (separated
+        /// by newlines) rather than one tag per line.
+        /// </summary>
+        private static string BuildVehicleDetail(Vehicles.VehicleTypes.VehicleType vehicleType)
+        {
+            var parts = new List<string> { "Vehicle" };
+            if (vehicleType == null)
+                return parts[0];
+
+            try
+            {
+                if (vehicleType.HasTag(BigAmbitions.Tags.TagRef.Vehicletag.istruck))
+                    parts.Add("Truck");
+                else if (vehicleType.HasTag(BigAmbitions.Tags.TagRef.Vehicletag.isscooter))
+                    parts.Add("Scooter");
+                else if (vehicleType.HasTag(BigAmbitions.Tags.TagRef.Vehicletag.ishandvehicle))
+                    parts.Add("Hand truck");
+            }
+            catch { /* tag database unavailable */ }
+
+            try
+            {
+                if (vehicleType.maxCargoCapacity > 0)
+                    parts.Add(vehicleType.maxCargoCapacity == 1 ? "1 storage slot" : $"{vehicleType.maxCargoCapacity} storage slots");
+                if (vehicleType.taxDeductible)
+                    parts.Add("Tax deductible");
+                if (vehicleType.autoParkSupported)
+                    parts.Add("Auto-park");
+                if (vehicleType.fitsFlatbed)
+                    parts.Add("Fits flatbed");
+                else if (vehicleType.fitsHandTruck)
+                    parts.Add("Fits hand truck");
+            }
+            catch { /* stats unavailable */ }
+
+            return JoinIntoLines(parts, 3);
+        }
+
+        /// <summary>
+        /// Joins tags into lines, packing up to <paramref name="perLine"/> tags on
+        /// each line (separated by a middle dot) and starting a new line after
+        /// that. Lines are separated by newlines.
+        /// </summary>
+        private static string JoinIntoLines(List<string> parts, int perLine)
+        {
+            var sb = new System.Text.StringBuilder();
+            for (int i = 0; i < parts.Count; i++)
+            {
+                if (i > 0)
+                    sb.Append(i % perLine == 0 ? "\n" : "  \u00b7  ");
+                sb.Append(parts[i]);
+            }
+            return sb.ToString();
         }
 
         /// <summary>The wholesale price for a full box of the product, or negative when unknown.</summary>

@@ -81,6 +81,9 @@ namespace SearchAnything
         public float Price;
         public int SellerCount;
 
+        /// <summary>Extra descriptive line shown under a product (e.g. a vehicle's category and features).</summary>
+        public string Detail;
+
         // -- Location --
         public CityBuildingController Controller;
         public string TypeLabel;

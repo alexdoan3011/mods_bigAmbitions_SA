@@ -34,15 +34,16 @@ namespace SearchAnything
         private const int MaxResultsShown = 80;
         private const int MaxSellersShown = 200;
 
-        // Floating layout sizes (kept compact so the mod's UI footprint stays small).
-        private const float SearchWidth = 540f;
-        private const float SearchHeight = 58f;
+        // Floating layout sizes (kept fairly compact, but wide enough that result
+        // text and the price/count columns fit comfortably).
+        private const float SearchWidth = 660f;
+        private const float SearchHeight = 62f;
         private const float TitleHeight = 56f;
-        private const float ResultsWidth = 540f;
-        private const float WhereWidth = 440f;
+        private const float ResultsWidth = 660f;
+        private const float WhereWidth = 540f;
         private const float Gap = 8f;
-        private const float HeaderHeight = 26f;
-        private const float PanelPad = 8f;
+        private const float HeaderHeight = 28f;
+        private const float PanelPad = 10f;
 
         public GameObject Root => _group != null ? _group.gameObject : null;
 
@@ -483,21 +484,48 @@ namespace SearchAnything
 
             if (result.Kind == ResultKind.Product)
             {
-                // Name (matched text highlighted live).
-                var name = UiFactory.Text(Highlight(result.DisplayName), rowImg.transform, 19f, UiFactory.TextColor);
-                UiFactory.SetWidth(name.gameObject, null, 1f);
+                // Name on top; for vehicles a muted breakdown (category and
+                // features, one per line) sits beneath it so the player can see
+                // what matched. Top-aligned so the name is always visible.
+                var block = UiFactory.Rect("Text", rowImg.transform, out _);
+                var pvlg = block.AddComponent<VerticalLayoutGroup>();
+                pvlg.childControlWidth = true;
+                pvlg.childControlHeight = true;
+                pvlg.childForceExpandWidth = true;
+                pvlg.childForceExpandHeight = false;
+                pvlg.spacing = 0f;
+                pvlg.childAlignment = TextAnchor.UpperLeft;
+                UiFactory.SetWidth(block, null, 1f);
+
+                var name = UiFactory.Text(Highlight(result.DisplayName), block.transform, 19f, UiFactory.TextColor);
+                UiFactory.SetSize(name.gameObject, null, 24f);
+
+                float rowHeight = 8f + 24f;
+                if (!string.IsNullOrEmpty(result.Detail))
+                {
+                    foreach (var line in result.Detail.Split('\n'))
+                    {
+                        if (string.IsNullOrEmpty(line))
+                            continue;
+                        var detailText = UiFactory.Text(Highlight(line), block.transform, 14f, UiFactory.MutedColor);
+                        UiFactory.SetSize(detailText.gameObject, null, 17f);
+                        rowHeight += 17f;
+                    }
+                }
 
                 if (result.Price >= 0f)
                 {
                     var price = UiFactory.Text($"${result.Price:0.##}", rowImg.transform, 18f,
                         UiFactory.AccentColor, TextAlignmentOptions.MidlineRight);
-                    UiFactory.SetWidth(price.gameObject, 84f, 0f);
+                    UiFactory.SetWidth(price.gameObject, 100f, 0f);
                 }
 
                 string countLabel = result.SellerCount == 1 ? "1 shop" : $"{result.SellerCount} shops";
                 var count = UiFactory.Text(countLabel, rowImg.transform, 17f, UiFactory.MutedColor,
                     TextAlignmentOptions.MidlineRight);
-                UiFactory.SetWidth(count.gameObject, 78f, 0f);
+                UiFactory.SetWidth(count.gameObject, 84f, 0f);
+
+                UiFactory.SetSize(rowImg.gameObject, null, Mathf.Max(52f, rowHeight));
             }
             else
             {
